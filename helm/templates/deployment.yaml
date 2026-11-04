@@ -1,0 +1,7 @@
+# Deployment of the markets container: image from values, replicas, labels from _helpers.tpl.
+
+# Environment: configuration from values and the ConfigMap, database connection string from the Secret.
+
+# Startup, readiness and liveness probes pointing at the health endpoints.
+
+# Resource requests and limits from values.

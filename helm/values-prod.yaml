@@ -1,0 +1,1 @@
+# Prod overrides: image tag set by the pipeline, replicas, database pod for now (managed server later through an existing Secret), small resource requests.

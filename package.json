@@ -1,0 +1,14 @@
+{
+  "name": "markets",
+  "description": "Market lifecycle service of Chance: draft, open, closed, resolved.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/main.js"
+  }
+}

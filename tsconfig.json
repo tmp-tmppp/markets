@@ -1,0 +1,14 @@
+// Minimal strict compiler settings: src/ compiles to dist/ as ES modules for the Node.js LTS runtime.
+// Tests live outside src/, so they never reach dist/; their type check comes with the test runner choice.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,7 @@
+# Defaults safe for a local cluster: image repository and tag, replicas, service port.
+
+# Database settings: in-cluster database pod on or off, or an existing Secret with the connection string.
+
+# Probe paths and timings, resource requests and limits.
+
+# Environment variables and the ConfigMap with runtime configuration.
