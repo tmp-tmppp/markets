@@ -42,11 +42,15 @@ jobs:
     # pin it to that tag's commit SHA (gh api repos/RSO-ekipa10/.github/commits/<tag> --jq .sha):
     #   uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@<40-character SHA> # <tag>
     # Dependabot keeps the pin and its comment current from then on.
-    uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@main
+    uses: tmp-tmppp/.github/.github/workflows/service-ci-cd.yml@main
     with:
       service: markets
       dockerhub-username: ${{ vars.DOCKERHUB_USERNAME }}
       azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      # Values that depend on the public address (organization variable PUBLIC_HOST): the issuer of the tokens.
+      public-host: ${{ vars.PUBLIC_HOST }}
+      host-values: |
+        env.AUTH_ISSUER=https://{host}/realms/chance
       sha: ${{ inputs.sha }}
     secrets:
       # Named secrets only (no "inherit"): the shared workflow gets nothing else.

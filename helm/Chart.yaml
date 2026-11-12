@@ -1,1 +1,7 @@
-# Chart metadata: name = markets, chart version, appVersion.
+apiVersion: v2
+name: markets
+description: Prediction markets of Chance, per tenant (create, open with funding from trading, close and resolve).
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

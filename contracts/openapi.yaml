@@ -1,0 +1,1088 @@
+openapi: 3.1.0
+info:
+  title: Chance markets API
+  version: 0.1.0
+  description: |
+    Prediction markets of one tenant: tenant admins create a market, open it (its creator's credits fund it in
+    trading), close it and resolve it; traders read the markets that are open, closed or resolved.
+
+    - Every endpoint except the health probes needs a bearer JWT issued by the identity provider.
+    - The tenant of the caller comes only from the token (claim `organization`), never from the request. A market of
+      another tenant answers `404`, exactly like a market that does not exist.
+    - Roles: `trader` and `tenant-admin` of the token's tenant. A `platform-admin` sees no tenant's data and gets
+      `403` on every markets endpoint, and so does a token without a tenant or without either role.
+    - Traders see open, closed and resolved markets only: a draft or opening market is left out of their list and
+      answers `404`; a trader asking `status=draft` or `status=opening` gets `403`.
+    - Errors are RFC 9457 `application/problem+json` with a stable `code`; the problem `type` is
+      `urn:chance:problem:<code with dashes>`, for example `urn:chance:problem:insufficient-credits`.
+    - A token that is wrong is answered `401`. Every authenticated endpoint may answer `503` with `Retry-After`: the
+      identity provider's signing keys cannot be fetched (`identity_provider_unavailable`), the caller's tenant is
+      still being set up in this service (`tenant_not_ready`, plan section 9), or, when opening, trading cannot be
+      called and nothing was sent (`trading_unavailable`).
+    - Every API answer carries `Cache-Control: private, no-store` (plan INF-02) and `X-Correlation-Id` (the caller's
+      own, when it sent a valid one).
+    - Opening is a saga (DM-19): the market becomes `opening`, trading's internal funding endpoint is called with the
+      market id as `Idempotency-Key`, and the outcome decides: `open` (200), back to `draft` (409 or 502 or 503), or
+      still `opening` (202) while the outcome is unknown; a background worker then repeats the same call until it
+      knows. Every change of a market raises its `version` by one (DM-04).
+    - Token contract v2: the token names exactly one organization (the tenant). The tenant role of the caller is the
+      organization's group in `organization.<alias>.groups`, `/tenant-admin` or `/trader`; `platform-admin` stays a
+      realm role. A `trader` or `tenant-admin` in the realm roles counts for nothing.
+    - Sharing: every market carries a sharing policy chosen when it is created (`sharing`: who may make share links
+      and of which types). A share link is a secret token of 32 random bytes (base64url), shown once when the link is
+      made and stored only as its SHA-256. The share URL keeps the token after `#` (`/share#<token>`), so it never
+      reaches a server log; the API takes the token in a request body, never in a path or a query. A link is for
+      `members` of the organization, for `profiles` (listed e-mail addresses, matched against the verified e-mail of
+      the signed-in caller) or for `everyone`. The policy cannot be changed after creation (the API has no update
+      of a market).
+    - The gateway routes the prefixes `/v1/markets` and `/v1/shared-markets`; `/v1/internal` and the health paths are
+      not routed by the gateway.
+servers:
+  - url: http://localhost:8080
+    description: Local run
+tags:
+  - name: Markets
+    description: Prediction markets of the caller's tenant
+  - name: Sharing
+    description: Share links of a market and the public lookup of a link
+  - name: Internal
+    description: Calls between services; never routed by the gateway
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/markets:
+    get:
+      tags: [Markets]
+      operationId: listMarkets
+      summary: List the tenant's markets
+      description: |
+        Trader or tenant admin. Newest first (the ids are UUIDv7). Without `status`, a tenant admin gets every
+        market and a trader the open, closed and resolved ones. Cursor pagination.
+      parameters:
+        - $ref: '#/components/parameters/Status'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of markets
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Markets]
+      operationId: createMarket
+      summary: Create a draft market
+      description: |
+        Tenant admin only. The market starts as `draft` at version 1; the caller becomes its creator, whose credits
+        fund it when it is opened. `closeTime` must be later than now plus the configured lead (default 5 minutes)
+        and at most 366 days ahead. `fundingAmount` is a whole number of credits within the configured bounds
+        (default 100 to 100000). `sharing` is optional and fixed for the life of the market; without it the market
+        is shared by `members` of the organization only. Unknown fields are refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMarketRequest'
+      responses:
+        '201':
+          description: Market created
+          headers:
+            Location:
+              description: Path of the new market, `/v1/markets/{id}`
+              schema:
+                type: string
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}:
+    get:
+      tags: [Markets]
+      operationId: getMarket
+      summary: One market
+      description: Trader or tenant admin. A trader gets `404` for a market that is draft or opening.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      responses:
+        '200':
+          description: The market
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}/open:
+    post:
+      tags: [Markets]
+      operationId: openMarket
+      summary: Open a draft market (funded by its creator)
+      description: |
+        Tenant admin, and only the market's creator (their credits fund it). No request body. The market becomes
+        `opening`, then trading is asked to take `fundingAmount` credits from the creator with the market id as
+        `Idempotency-Key`:
+
+        - funded: the market is `open` (200) and MarketOpened is published;
+        - insufficient credits: back in `draft` (409, code `insufficient_credits`);
+        - trading rejected the request with another 4xx: back in `draft`, nothing funded (502, code `funding_rejected`);
+        - trading could not be called and nothing was sent (open circuit): back in `draft` (503, code
+          `trading_unavailable`, with `Retry-After`);
+        - anything else (timeout, network error, 5xx after the retries): the outcome is unknown, the market stays
+          `opening` (202) and the service repeats the same call in the background until it knows.
+
+        A market that is already `opening` answers 202 at once, without a new call.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      responses:
+        '200':
+          description: Funded; the market is open
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '202':
+          description: The funding outcome is unknown; the market stays opening and is retried in the background
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Not a tenant admin, or not the creator of the market (code `forbidden`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The market is not a draft (code `invalid_state`), or the creator lacks the credits (code
+            `insufficient_credits`, type `urn:chance:problem:insufficient-credits`): the market is back in draft
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '502':
+          description: |
+            Trading rejected the funding request (code `funding_rejected`, type `urn:chance:problem:funding-rejected`):
+            nothing was funded and the market is back in draft
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}/close:
+    post:
+      tags: [Markets]
+      operationId: closeMarket
+      summary: Close an open market
+      description: |
+        Any tenant admin of the tenant. No request body. Publishes MarketClosed. The service also closes an open market by
+        itself when its closeTime has passed (UC-15, within about AUTO_CLOSE_INTERVAL_MS): the same transition (version + 1,
+        MarketClosed) with closedBy `system:auto-close`. A market closed either way answers 409 invalid_state here.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      responses:
+        '200':
+          description: The market is closed
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidState'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}/resolve:
+    post:
+      tags: [Markets]
+      operationId: resolveMarket
+      summary: Resolve a closed market
+      description: |
+        Any tenant admin of the tenant, only from `closed`. Sets the outcome (`YES`, `NO`, or `INVALID` to cancel the
+        market economically, UC-16) and publishes MarketResolved; the version goes up by one in every case.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveMarketRequest'
+      responses:
+        '200':
+          description: The market is resolved
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidState'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}/share-links:
+    post:
+      tags: [Sharing]
+      operationId: createShareLink
+      summary: Make a share link for a market
+      description: |
+        Trader or tenant admin, as the market's sharing policy allows: `whoMayShare` `none` lets nobody, `admins`
+        only tenant admins, `members` every trader and tenant admin; and the link `type` must be one of the policy's
+        `linkTypes` (else 403, code `forbidden`). Only a market that is open, closed or resolved can be shared (else
+        409, `invalid_state`); a market the caller may not see answers 404.
+
+        - `members`: the link shows the market to members of the organization (a token of that organization).
+        - `profiles`: the link shows it to the signed-in callers whose verified e-mail address is in `emails`
+          (1 to 50 valid addresses, compared in lower case); `emails` is refused for the other types.
+        - `everyone`: anybody who has the link may see the market's summary, signed in or not.
+
+        The answer is 201 and carries the `token` and the share URL path `/share#<token>`: the token is shown only
+        here (the service keeps its SHA-256 only), so the caller must keep it. Publishes ShareLinkCreated.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareLinkRequest'
+      responses:
+        '201':
+          description: Share link made; the token is in this answer only
+          headers:
+            Location:
+              description: Path of the new link, `/v1/markets/{id}/share-links/{linkId}`
+              schema:
+                type: string
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedShareLink'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidState'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Sharing]
+      operationId: listShareLinks
+      summary: List the share links of a market
+      description: |
+        A tenant admin sees every link of the market, a trader only the links the trader made. Newest first, cursor
+        pagination. The tokens are never listed: they are shown once, when the link is made.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of links, without tokens
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/markets/{id}/share-links/{linkId}:
+    delete:
+      tags: [Sharing]
+      operationId: revokeShareLink
+      summary: Revoke a share link
+      description: |
+        The tenant admin, or the trader who made the link. From then on the link's token answers like an unknown one.
+        Repeating the call is fine (204 again, no second event). A link of another market, another tenant or another
+        trader answers 404. Publishes ShareLinkRevoked when the link was active.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/ShareLinkId'
+      responses:
+        '204':
+          description: The link is revoked
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/shared-markets/lookup:
+    post:
+      tags: [Sharing]
+      operationId: lookupSharedMarket
+      summary: What does this share link show, and what may the caller do next?
+      description: |
+        Public: the token is in the body (never in the URL) and a bearer token is optional. Without one the caller is
+        anonymous; a bearer token that is wrong is answered 401 like everywhere else.
+
+        - An unknown, expired or revoked token answers one and the same `404` (code `not_found`), so the endpoint is no
+          oracle for the state of a token.
+        - A link of type `everyone` shows the market summary to everybody.
+        - A link of type `members` shows it only to a caller whose token belongs to that organization with a tenant
+          role; a link of type `profiles` only to a signed-in caller whose verified e-mail address is on its list.
+          Anybody else gets `403` (code `share_link_not_permitted`) that names nothing of the link or the market; its
+          `organization.name` is the organization's display name only with `switch_organization` (below) and null otherwise.
+
+        `next` says what the caller may do about it: `sign_in` (anonymous), `join` (signed in, not a member of the
+        organization by this token: the web calls `POST /v1/share-joins` of tenants, which admits the caller where the
+        link allows it), `switch_organization` (a `members` link for a signed-in caller whose token is for another
+        organization: the caller may be a member there; `organization.name` is what the web compares with the names
+        of the caller's own organizations) and `trade` (a member of the organization, market open).
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LookupRequest'
+      responses:
+        '200':
+          description: The link is valid and this caller may see the market
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lookup'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            The link is valid but not for this caller (code `share_link_not_permitted`); the problem carries
+            `organization.name` and `next`, nothing else
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No valid link has this token (unknown, expired or revoked; code `not_found`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/share-links/admission:
+    post:
+      tags: [Internal]
+      operationId: admitShareLink
+      summary: What does this share link let this caller do? (called by tenants)
+      description: |
+        Internal, never routed by the gateway. The caller is the service `tenants`: a client-credentials token whose
+        client id (the `azp` claim, `INTERNAL_AUTH_TENANTS_CLIENT_ID`) is the one markets expects; a user's token, or
+        another service's, answers 403. It is the same shape as `tenants/contracts/markets-admission.openapi.yaml`.
+        The call changes nothing. The token of the link is in the body only and is never logged.
+
+        `decision`: `join` (type `everyone`, or `profiles` with `userEmail` on the list and `emailVerified` true),
+        `members_only` (type `members`: tenants lets an existing member through and adds nobody) or `denied` (type
+        `profiles`, the e-mail address is not on the list or not verified). An unknown, expired or revoked token
+        answers the same `404`.
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdmissionRequest'
+      responses:
+        '200':
+          description: The link is valid; `decision` says what the caller may do
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdmissionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The token does not belong to the client that may call this endpoint (code `forbidden`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No valid link has this token (unknown, expired or revoked; code `not_found`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service has applied its migrations and listens.
+      security: []
+      responses:
+        '200':
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: |
+        Pings the service's own database only (always ready with in-memory stores); trading, NATS and the identity
+        provider are not checked. Answers 503 from the moment the process gets SIGTERM until it exits, so the load
+        balancer stops sending requests before the server closes.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer (`not_ready`), or the service is shutting down (`shutting_down`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: Process only. It never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience, signature and a required `exp`).
+        Token contract v2: the tenant is the single organization alias in the `organization` claim (the tenant id, a
+        UUID); the tenant role is that organization's group, `/tenant-admin` or `/trader`, in
+        `organization.<alias>.groups`; `platform-admin` is a realm role. The `email` and `email_verified` claims are
+        used for share links of type `profiles`.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Client-credentials token of the service that calls an internal endpoint (client `tenants`), verified like a
+        user token against `INTERNAL_AUTH_AUDIENCE`; its `azp` claim must name the client that endpoint admits.
+
+  headers:
+    CacheControl:
+      description: Always `private, no-store`
+      schema:
+        type: string
+        const: private, no-store
+
+  parameters:
+    MarketId:
+      name: id
+      in: path
+      required: true
+      description: Market id (UUID). A market of another tenant answers 404.
+      schema:
+        type: string
+        format: uuid
+    ShareLinkId:
+      name: linkId
+      in: path
+      required: true
+      description: Share link id (UUID), as listed by `GET /v1/markets/{id}/share-links`
+      schema:
+        type: string
+        format: uuid
+    Status:
+      name: status
+      in: query
+      required: false
+      description: Only markets in this status. Traders may ask for `open`, `closed` and `resolved` only (else 403).
+      schema:
+        $ref: '#/components/schemas/MarketStatus'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `nextCursor` of the previous page
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+
+  responses:
+    BadRequest:
+      description: The request is invalid (code `validation_failed`); `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        The token lacks the required role, is a platform admin's, has no tenant, or (traders) asks for draft or
+        opening markets, or the market's sharing policy does not allow this caller or this link type (code `forbidden`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: |
+        No such market, or share link, in the caller's tenant (code `not_found`); also a draft or opening market for a
+        trader
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InvalidState:
+      description: The market is not in a status that allows this action (code `invalid_state`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Try again after the time in `Retry-After`. The code says why:
+        - `identity_provider_unavailable`: the signing keys of the identity provider cannot be fetched, so the token
+          cannot be checked. The token is not necessarily wrong; a wrong one (expired, bad signature, wrong issuer or
+          audience, unknown key id, malformed) is answered `401`.
+        - `tenant_not_ready`: the caller's tenant is still being set up in this service (its TenantCreated event has
+          not been processed yet).
+        - `trading_unavailable` (opening only): trading could not be called and nothing was sent; the market is back
+          in draft.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    MarketStatus:
+      type: string
+      enum: [draft, opening, open, closed, resolved]
+    Outcome:
+      type: string
+      enum: ['YES', 'NO', 'INVALID']
+      description: |
+        `YES` or `NO`: the answer. `INVALID` (UC-16): the question cannot be answered; the market is resolved all the
+        same, and trading refunds every stake and returns the rest of the funding to the creator.
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI reference that identifies the problem type
+          examples: ['urn:chance:problem:insufficient-credits']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          description: The request path
+        code:
+          type: string
+          description: Machine-readable problem code
+          examples: [insufficient_credits, funding_rejected, invalid_state, tenant_not_ready, share_link_not_permitted]
+        organization:
+          type: object
+          description: Only on the 403 `share_link_not_permitted` of the lookup
+          required: [name]
+          properties:
+            name:
+              type: [string, 'null']
+              description: Display name of the organization; null when this service has not learned it
+        next:
+          type: array
+          description: Only on the 403 `share_link_not_permitted` of the lookup; what the caller may do about it
+          items:
+            $ref: '#/components/schemas/NextAction'
+        errors:
+          type: array
+          description: Invalid fields of a 400 answer
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [up]
+    Market:
+      type: object
+      required:
+        - id
+        - tenantId
+        - question
+        - description
+        - closeTime
+        - startingPrice
+        - fundingAmount
+        - status
+        - outcome
+        - version
+        - createdBy
+        - createdAt
+        - updatedAt
+        - openedAt
+        - closedAt
+        - closedBy
+        - resolvedAt
+        - resolvedBy
+        - sharing
+      properties:
+        sharing:
+          $ref: '#/components/schemas/SharingPolicy'
+        id:
+          type: string
+          format: uuid
+          description: UUIDv7
+        tenantId:
+          type: string
+          format: uuid
+        question:
+          type: string
+          minLength: 10
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        closeTime:
+          type: string
+          format: date-time
+        startingPrice:
+          type: number
+          minimum: 0.01
+          maximum: 0.99
+          description: Starting price of YES, two decimals; NO starts at 1 - startingPrice
+        fundingAmount:
+          type: integer
+          minimum: 1
+          description: Credits the creator pays to open the market (1 credit, the unit of payments' amount)
+        status:
+          $ref: '#/components/schemas/MarketStatus'
+        outcome:
+          description: Set exactly when the market is resolved
+          oneOf:
+            - $ref: '#/components/schemas/Outcome'
+            - type: 'null'
+        version:
+          type: integer
+          minimum: 1
+          description: 1 at creation, +1 on every change of status (DM-04)
+        createdBy:
+          type: string
+          description: Subject of the tenant admin who created the market; their credits fund it
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        openedAt:
+          type: [string, 'null']
+          format: date-time
+        closedAt:
+          type: [string, 'null']
+          format: date-time
+        closedBy:
+          type: [string, 'null']
+          description: |
+            Subject of the tenant admin who closed the market, or the fixed value `system:auto-close` when the service closed
+            it itself because its closeTime had passed (UC-15).
+        resolvedAt:
+          type: [string, 'null']
+          format: date-time
+        resolvedBy:
+          type: [string, 'null']
+    MarketPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Market'
+        nextCursor:
+          type: [string, 'null']
+          description: Null on the last page
+    CreateMarketRequest:
+      type: object
+      additionalProperties: false
+      required: [question, closeTime, startingPrice, fundingAmount]
+      properties:
+        question:
+          type: string
+          minLength: 10
+          maxLength: 200
+          description: 10 to 200 characters after trimming, no control characters
+        description:
+          type: string
+          maxLength: 2000
+          default: ''
+          description: Up to 2000 characters after trimming; tabs and line breaks allowed
+        closeTime:
+          type: string
+          format: date-time
+          description: RFC 3339 with a time zone; later than now plus the configured lead, at most 366 days ahead
+        startingPrice:
+          type: number
+          minimum: 0.01
+          maximum: 0.99
+          description: Starting price of YES with at most two decimals
+          examples: [0.35]
+        fundingAmount:
+          type: integer
+          minimum: 1
+          description: Whole credits within the configured bounds (default 100 to 100000)
+          examples: [1000]
+        sharing:
+          $ref: '#/components/schemas/SharingPolicyInput'
+    WhoMayShare:
+      type: string
+      enum: [none, admins, members]
+      description: |
+        `none`: nobody makes share links; `admins`: tenant admins only; `members`: every trader and tenant admin of
+        the organization.
+    LinkType:
+      type: string
+      enum: [members, profiles, everyone]
+    NextAction:
+      type: string
+      enum: [sign_in, join, switch_organization, trade]
+    SharingPolicy:
+      type: object
+      description: Who may make share links of the market and of which types; fixed when the market is created
+      required: [whoMayShare, linkTypes]
+      properties:
+        whoMayShare:
+          $ref: '#/components/schemas/WhoMayShare'
+        linkTypes:
+          type: array
+          description: The link types the market may be shared with, each once, in the order members, profiles, everyone
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/LinkType'
+    SharingPolicyInput:
+      type: object
+      additionalProperties: false
+      description: A field that is left out takes its default (`members`, and `[members]`)
+      properties:
+        whoMayShare:
+          $ref: '#/components/schemas/WhoMayShare'
+        linkTypes:
+          type: array
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/LinkType'
+    CreateShareLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/LinkType'
+        emails:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: Only for type `profiles` (required there, refused for the other types); valid addresses, compared in lower case
+          items:
+            type: string
+            maxLength: 254
+        expiresAt:
+          type: string
+          format: date-time
+          description: RFC 3339 with a time zone, later than now; without it the link does not expire
+    ShareLinkStatus:
+      type: string
+      enum: [active, revoked, expired]
+    ShareLink:
+      type: object
+      required: [id, marketId, type, emails, createdBy, createdAt, expiresAt, revokedAt, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        marketId:
+          type: string
+          format: uuid
+        type:
+          $ref: '#/components/schemas/LinkType'
+        emails:
+          type: array
+          description: The listed addresses (lower case) of a `profiles` link; empty for the other types
+          items:
+            type: string
+        createdBy:
+          type: string
+          description: Subject of the user who made the link
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        revokedAt:
+          type: [string, 'null']
+          format: date-time
+        status:
+          $ref: '#/components/schemas/ShareLinkStatus'
+    CreatedShareLink:
+      allOf:
+        - $ref: '#/components/schemas/ShareLink'
+        - type: object
+          required: [token, urlPath]
+          properties:
+            token:
+              type: string
+              pattern: '^[A-Za-z0-9_-]{43}$'
+              description: 32 random bytes in base64url (43 characters); shown only in this answer
+            urlPath:
+              type: string
+              pattern: '^/share#[A-Za-z0-9_-]{43}$'
+              description: The share URL path; the web puts its own origin in front. The token is after `#`, so no server sees it.
+    ShareLinkPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShareLink'
+        nextCursor:
+          type: [string, 'null']
+          description: Null on the last page
+    LookupRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{43}$'
+          description: The token of the share link, as taken from the part of the share URL after `#`
+    Lookup:
+      type: object
+      required: [linkType, market, organization, next]
+      properties:
+        linkType:
+          $ref: '#/components/schemas/LinkType'
+        market:
+          type: object
+          required: [id, question, status, closeTime]
+          properties:
+            id:
+              type: string
+              format: uuid
+            question:
+              type: string
+              description: The market's title
+            status:
+              $ref: '#/components/schemas/MarketStatus'
+            closeTime:
+              type: string
+              format: date-time
+        organization:
+          type: object
+          required: [alias, name]
+          properties:
+            alias:
+              type: string
+              format: uuid
+              description: The organization alias, the same text as the tenant id
+            name:
+              type: [string, 'null']
+              description: Display name of the organization; null when this service has not learned it
+        next:
+          type: array
+          items:
+            $ref: '#/components/schemas/NextAction'
+    AdmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [token, userEmail, emailVerified]
+      properties:
+        token:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{43}$'
+        userEmail:
+          type: [string, 'null']
+          maxLength: 320
+          description: The `email` claim of the signed-in caller, null when the token has none; used only with `emailVerified` true
+        emailVerified:
+          type: boolean
+    AdmissionResponse:
+      type: object
+      additionalProperties: false
+      required: [decision, linkType, tenantId, marketId]
+      properties:
+        decision:
+          type: string
+          enum: [join, members_only, denied]
+        linkType:
+          $ref: '#/components/schemas/LinkType'
+        tenantId:
+          type: string
+          format: uuid
+        marketId:
+          type: string
+          format: uuid
+    ResolveMarketRequest:
+      type: object
+      additionalProperties: false
+      required: [outcome]
+      properties:
+        outcome:
+          $ref: '#/components/schemas/Outcome'

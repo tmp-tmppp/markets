@@ -1,1 +1,15 @@
-# ClusterIP Service named after the chart, forwarding the service port to the container port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "markets.fullname" . }}
+  labels:
+    {{- include "markets.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "markets.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

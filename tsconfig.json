@@ -1,14 +1,19 @@
-// Minimal strict compiler settings: src/ compiles to dist/ as ES modules for the Node.js LTS runtime.
-// Tests live outside src/, so they never reach dist/; their type check comes with the test runner choice.
+// Strict compiler settings for the type check: source, tests and the tool configuration, without output.
+// The build uses tsconfig.build.json, which compiles only src/ to dist/.
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2023",
+    "lib": ["ES2023"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "types": ["node"],
     "strict": true,
-    "rootDir": "src",
-    "outDir": "dist",
-    "skipLibCheck": true
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src", "tests", "vitest.config.ts", "vitest.integration.config.ts"]
 }
